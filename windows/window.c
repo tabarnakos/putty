@@ -81,6 +81,7 @@
 #ifndef WHEEL_DELTA
 #define WHEEL_DELTA 120
 #endif
+#define WHEEL_SCROLL_LINES_DEFAULT 3 /* (system default 2020/03/31) */
 
 /* VK_PACKET, used to send Unicode characters in WM_KEYDOWNs */
 #ifndef VK_PACKET
@@ -88,6 +89,7 @@
 #endif
 
 static Mouse_Button translate_button(Mouse_Button button);
+static void update_wheel_scroll_config(void);
 static LRESULT CALLBACK WndProc(HWND, UINT, WPARAM, LPARAM);
 static int TranslateKey(UINT message, WPARAM wParam, LPARAM lParam,
                         unsigned char *output);
@@ -215,6 +217,7 @@ static char *window_name, *icon_name;
 static int compose_state = 0;
 
 static UINT wm_mousewheel = WM_MOUSEWHEEL;
+static int wheel_scroll_lines = WHEEL_SCROLL_LINES_DEFAULT;
 
 #define IS_HIGH_VARSEL(wch1, wch2) \
     ((wch1) == 0xDB40 && ((wch2) >= 0xDD00 && (wch2) <= 0xDDEF))
@@ -507,11 +510,17 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmdline, int show)
      * If we're running a version of Windows that doesn't support
      * WM_MOUSEWHEEL, find out what message number we should be
      * using instead.
+     *
+     * Wheel support was added in Windows 95. Is it time to remove 
+     * this check ? 
      */
     if (osMajorVersion < 4 ||
-        (osMajorVersion == 4 && osPlatformId != VER_PLATFORM_WIN32_NT))
+        (osMajorVersion == 4 && osPlatformId != VER_PLATFORM_WIN32_NT)) {
         wm_mousewheel = RegisterWindowMessage("MSWHEEL_ROLLMSG");
-
+    } else {
+        update_wheel_scroll_config();
+    }
+     
     init_help();
 
     init_winfuncs();
@@ -1158,6 +1167,34 @@ static void update_mouse_pointer(void)
          * cursor, the previous visibility state is restored. */
         ShowCursor(force_visible);
         forced_visible = force_visible;
+    }
+}
+
+static void update_wheel_scroll_config(void)
+{
+    /* Gets the system configuration for the number
+     * of lines to scroll per wheel tick.
+     */
+    UINT system_wheel_scroll_lines;
+    BOOL return_code = SystemParametersInfo(
+        SPI_GETWHEELSCROLLLINES,
+        0,
+        &system_wheel_scroll_lines,
+        0);
+    if ( return_code != FALSE) {
+        wheel_scroll_lines = system_wheel_scroll_lines;
+    } else {
+        /* system call failed, don't update the default value */
+#ifndef NDEBUG
+        /* It would be a bit zealous to keep this msgbox in release versions */
+        DWORD error_code = GetLastError();
+        char* str = dupprintf("%s Warning", appname);
+        char* msg = dupprintf("Unable to get system parameter for mouse wheel.\nError %08x\n%s",
+            error_code, "https://docs.microsoft.com/en-us/windows/win32/debug/system-error-codes");
+        MessageBox(NULL, msg, str, MB_ICONERROR | MB_OK);
+        sfree(str);
+        sfree(msg);
+#endif /* NDEBUG */
     }
 }
 
@@ -3340,6 +3377,12 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT message,
       case WM_GOT_CLIPDATA:
         process_clipdata((HGLOBAL)lParam, wParam);
         return 0;
+      case WM_SETTINGCHANGE:
+          if (wParam == SPI_SETWHEELSCROLLLINES) {
+              update_wheel_scroll_config();
+              return 0;
+          }
+          break;
       default:
         if (message == wm_mousewheel || message == WM_MOUSEWHEEL) {
             bool shift_pressed = false, control_pressed = false;
@@ -3387,10 +3430,25 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT message,
                                    control_pressed, is_alt_pressed());
                     } /* else: not sure when this can fail */
                 } else {
+                    int lines_to_scroll;
+                    if ( (wheel_scroll_lines == WHEEL_PAGESCROLL) || 
+                        (wheel_scroll_lines > term->rows) ) {
+                        /* 
+                         * Microsoft defines this setting as being the
+                         * equivalent of pressing page-up or page-down.
+                         * https://docs.microsoft.com/en-us/windows/win32/inputdev/about-mouse-input#determining-the-number-of-scroll-lines
+                         * The same applies when the number is larger
+                         * than the number of lines.
+                         */
+                        lines_to_scroll = term->rows - 1;
+                    } else {
+                        lines_to_scroll = wheel_scroll_lines;
+                    }
+
                     /* trigger a scroll */
                     term_scroll(term, 0,
                                 b == MBT_WHEEL_UP ?
-                                -term->rows / 2 : term->rows / 2);
+                                -lines_to_scroll : lines_to_scroll);
                 }
             }
             return 0;
