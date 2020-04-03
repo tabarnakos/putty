@@ -82,6 +82,8 @@
 #define WHEEL_DELTA 120
 #endif
 #define WHEEL_SCROLL_LINES_DEFAULT 3 /* (system default 2020/03/31) */
+/* This could be the new default, with a setting under Terminal -> features */
+#define OPTIMIZED_SCROLLING  /* Support for fine-resolution scrollwheels */
 
 /* VK_PACKET, used to send Unicode characters in WM_KEYDOWNs */
 #ifndef VK_PACKET
@@ -89,7 +91,6 @@
 #endif
 
 static Mouse_Button translate_button(Mouse_Button button);
-static void update_wheel_scroll_config(void);
 static LRESULT CALLBACK WndProc(HWND, UINT, WPARAM, LPARAM);
 static int TranslateKey(UINT message, WPARAM wParam, LPARAM lParam,
                         unsigned char *output);
@@ -216,8 +217,20 @@ static char *window_name, *icon_name;
 
 static int compose_state = 0;
 
+/* scroll wheel stuff */
 static UINT wm_mousewheel = WM_MOUSEWHEEL;
 static int wheel_scroll_lines = WHEEL_SCROLL_LINES_DEFAULT;
+static int wheel_delta_per_line = (WHEEL_DELTA / WHEEL_SCROLL_LINES_DEFAULT);
+typedef enum {
+    WHEEL_SCROLL_MODE_ABSOLUTE,
+    WHEEL_SCROLL_MODE_LINES,
+    WHEEL_SCROLL_MODE_LINES_ENHANCED,
+    WHEEL_SCROLL_MODE_PAGE,
+    WHEEL_SCROLL_MODE_ZOOM
+} Scroll_Mode;
+static void update_wheel_scroll_config(void);
+static void term_window_scroll(HWND, LPARAM, Scroll_Mode, bool, 
+                               bool, Mouse_Button);
 
 #define IS_HIGH_VARSEL(wch1, wch2) \
     ((wch1) == 0xDB40 && ((wch2) >= 0xDD00 && (wch2) <= 0xDDEF))
@@ -1182,7 +1195,8 @@ static void update_wheel_scroll_config(void)
         &system_wheel_scroll_lines,
         0);
     if ( return_code != FALSE) {
-        wheel_scroll_lines = system_wheel_scroll_lines;
+    	wheel_scroll_lines = system_wheel_scroll_lines;
+        wheel_delta_per_line = (WHEEL_DELTA / system_wheel_scroll_lines);
     } else {
         /* system call failed, don't update the default value */
 #ifndef NDEBUG
@@ -3386,7 +3400,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT message,
       default:
         if (message == wm_mousewheel || message == WM_MOUSEWHEEL) {
             bool shift_pressed = false, control_pressed = false;
-
+            
             if (message == WM_MOUSEWHEEL) {
                 wheel_accumulator += (short)HIWORD(wParam);
                 shift_pressed=LOWORD(wParam) & MK_SHIFT;
@@ -3399,58 +3413,34 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT message,
                     control_pressed=keys[VK_CONTROL]&0x80;
                 }
             }
-
-            /* process events when the threshold is reached */
-            while (abs(wheel_accumulator) >= WHEEL_DELTA) {
-                int b;
-
-                /* reduce amount for next time */
-                if (wheel_accumulator > 0) {
-                    b = MBT_WHEEL_UP;
-                    wheel_accumulator -= WHEEL_DELTA;
-                } else if (wheel_accumulator < 0) {
-                    b = MBT_WHEEL_DOWN;
-                    wheel_accumulator += WHEEL_DELTA;
-                } else
-                    break;
-
-                if (send_raw_mouse &&
-                    !(conf_get_bool(conf, CONF_mouse_override) &&
-                      shift_pressed)) {
-                    /* Mouse wheel position is in screen coordinates for
-                     * some reason */
-                    POINT p;
-                    p.x = X_POS(lParam); p.y = Y_POS(lParam);
-                    if (ScreenToClient(hwnd, &p)) {
-                        /* send a mouse-down followed by a mouse up */
-                        term_mouse(term, b, translate_button(b),
-                                   MA_CLICK,
-                                   TO_CHR_X(p.x),
-                                   TO_CHR_Y(p.y), shift_pressed,
-                                   control_pressed, is_alt_pressed());
-                    } /* else: not sure when this can fail */
-                } else {
-                    int lines_to_scroll;
-                    if ( (wheel_scroll_lines == WHEEL_PAGESCROLL) || 
-                        (wheel_scroll_lines > term->rows) ) {
-                        /* 
-                         * Microsoft defines this setting as being the
-                         * equivalent of pressing page-up or page-down.
-                         * https://docs.microsoft.com/en-us/windows/win32/inputdev/about-mouse-input#determining-the-number-of-scroll-lines
-                         * The same applies when the number is larger
-                         * than the number of lines.
-                         */
-                        lines_to_scroll = term->rows - 1;
-                    } else {
-                        lines_to_scroll = wheel_scroll_lines;
-                    }
-
-                    /* trigger a scroll */
-                    term_scroll(term, 0,
-                                b == MBT_WHEEL_UP ?
-                                -lines_to_scroll : lines_to_scroll);
-                }
+            Scroll_Mode wheel_scroll_mode;
+            /* determines which wheel scroll mode we are in */
+            if ( send_raw_mouse &&
+                !( conf_get_bool(conf, CONF_mouse_override) &&
+                shift_pressed ) ) {
+                wheel_scroll_mode = WHEEL_SCROLL_MODE_ABSOLUTE;
+            } else if ( control_pressed ) {
+                wheel_scroll_mode = WHEEL_SCROLL_MODE_ZOOM;
+            } else if ( wheel_scroll_lines == WHEEL_PAGESCROLL ||
+                        wheel_scroll_lines > term->rows ) {
+                wheel_scroll_mode = WHEEL_SCROLL_MODE_PAGE;
+            } else {
+#ifdef OPTIMIZED_SCROLLING
+                /* to be replaced with a menu option */
+                wheel_scroll_mode = WHEEL_SCROLL_MODE_LINES_ENHANCED;
+#else
+                wheel_scroll_mode = WHEEL_SCROLL_MODE_LINES;
+#endif                
             }
+
+            Mouse_Button wheel_dir = wheel_accumulator < 0 ?
+                MBT_WHEEL_DOWN : MBT_WHEEL_UP;
+            /* I don't like to nest switch cases, better dump all the required
+             * locals into an inline function.
+             */
+            term_window_scroll(hwnd, lParam, wheel_scroll_mode, shift_pressed,
+                               control_pressed, wheel_dir);
+
             return 0;
         }
     }
@@ -5842,6 +5832,74 @@ static void flip_full_screen()
     } else {
         SendMessage(wgs.term_hwnd, WM_FULLSCR_ON_MAX, 0, 0);
         ShowWindow(wgs.term_hwnd, SW_MAXIMIZE);
+    }
+}
+
+static inline void term_window_scroll(HWND hwnd, LPARAM lParam, 
+                                      Scroll_Mode wheel_mode,
+                                      bool is_shift_pressed, 
+                                      bool is_ctrl_pressed, 
+                                      Mouse_Button wheel_dir) {
+    int lines_to_scroll=0;
+    div_t div_rslt = {0,0};
+    switch ( wheel_mode ) {
+      case WHEEL_SCROLL_MODE_LINES:
+        div_rslt = div(wheel_accumulator, WHEEL_DELTA);
+        lines_to_scroll -= wheel_scroll_lines * div_rslt.quot;
+        break;
+      case WHEEL_SCROLL_MODE_LINES_ENHANCED:
+        div_rslt = div(wheel_accumulator, wheel_delta_per_line);
+        lines_to_scroll -= div_rslt.quot;
+        break;
+
+      case WHEEL_SCROLL_MODE_PAGE:
+        /*
+         * Microsoft defines this setting as being the
+         * equivalent of pressing page-up or page-down.
+         * https://docs.microsoft.com/en-us/windows/win32/inputdev/about-mouse-input#determining-the-number-of-scroll-lines
+         * The same applies when the number is larger
+         * than the number of lines.
+         */
+        div_rslt = div(wheel_accumulator, WHEEL_DELTA);
+        if ( div_rslt.quot != 0 ) {
+            lines_to_scroll += wheel_dir == MBT_WHEEL_UP ?
+                1 - term->rows : term->rows - 1;
+        }
+        break;
+
+      case WHEEL_SCROLL_MODE_ABSOLUTE:
+        /* Mouse wheel position is in screen coordinates for
+         * some reason. */
+        div_rslt = div(wheel_accumulator, WHEEL_DELTA);
+        
+        POINT p;
+        p.x = X_POS(lParam); p.y = Y_POS(lParam);
+        if ( ScreenToClient(hwnd, &p) ) {
+            /* process events when the threshold is reached */
+            for (int i=0; i< abs(div_rslt.quot); ++i) {
+                /* send a mouse-down followed by a mouse up */
+                term_mouse(term, wheel_dir, translate_button(wheel_dir),
+                           MA_CLICK,
+                           TO_CHR_X(p.x),
+                           TO_CHR_Y(p.y), is_shift_pressed,
+                           is_ctrl_pressed, is_alt_pressed());
+            }
+        } /* else: not sure when this can fail */
+        break;
+
+      case WHEEL_SCROLL_MODE_ZOOM:
+        /* TODO: implement zoom case*/
+        /* for now this case does nothing */
+        break;
+
+      default:
+        unreachable("something when wrong");
+        break;
+    }
+    wheel_accumulator = div_rslt.rem;
+    if ( lines_to_scroll ) {
+        /* trigger a scroll */
+        term_scroll(term, 0, lines_to_scroll);
     }
 }
 
